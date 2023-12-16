@@ -1,10 +1,13 @@
-use std::{collections::HashMap, env};
+use std::{collections::HashMap, env, sync::OnceLock};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum_auth::AuthBearer;
 use tower::ServiceBuilder;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+static AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -19,11 +22,16 @@ async fn main() -> Result<()> {
 
     let _ = dotenvy::dotenv();
     let port = env::var("PORT").unwrap_or("7788".to_string());
+    let auth_token = env::var("AUTH_TOKEN")?;
+    AUTH_TOKEN
+        .set(auth_token)
+        .map_err(|_| anyhow!("Auth token could not be set"))?;
 
     let compression_service = ServiceBuilder::new().layer(CompressionLayer::new());
 
     let app = Router::new()
         .route("/", get(handler))
+        .fallback(handler_404)
         .layer(TraceLayer::new_for_http())
         .layer(compression_service);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -31,8 +39,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handler(Query(params): Query<HashMap<String, String>>) -> Result<&'static str, AppError> {
-    Ok("hi")
+async fn handler(
+    AuthBearer(token): AuthBearer,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if &token != AUTH_TOKEN.get().unwrap() {
+        return Ok((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
+    }
+    Ok((StatusCode::OK, params.get("url").unwrap().to_string()))
+}
+
+async fn handler_404() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "nothing to see here")
 }
 
 struct AppError(anyhow::Error);
