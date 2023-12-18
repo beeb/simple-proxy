@@ -1,19 +1,13 @@
 /// A simple proxy that forwards requests to a given URL with a custom User-Agent.
-use std::{
-    collections::HashMap,
-    env,
-    net::SocketAddr,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, env, net::SocketAddr, sync::OnceLock};
 
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
-    extract::{connect_info::Connected, ConnectInfo, Query, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    serve::IncomingStream,
     Router,
 };
 use axum_auth::AuthBearer;
@@ -81,21 +75,18 @@ async fn main() -> Result<()> {
 async fn handler(
     AuthBearer(token): AuthBearer,
     Query(params): Query<HashMap<String, String>>,
-    ConnectInfo(ci): ConnectInfo<ClientConnectInfo>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     if &token != AUTH_TOKEN.get().unwrap() {
-        tracing::error!(
-            peer = ci.peer_addr.to_string(),
-            "Unauthorized access attempt"
-        );
+        tracing::error!(peer = addr.to_string(), "Unauthorized access attempt");
         return Ok((
             StatusCode::UNAUTHORIZED,
             Bytes::from_static(b"Unauthorized"),
         ));
     }
     let Some(url) = params.get("url") else {
-        tracing::error!(peer = ci.peer_addr.to_string(), "Missing `url` param");
+        tracing::error!(peer = addr.to_string(), "Missing `url` param");
         return Ok((
             StatusCode::BAD_REQUEST,
             Bytes::from_static(b"Missing `url` param"),
@@ -105,11 +96,13 @@ async fn handler(
     match request.status() {
         reqwest::StatusCode::OK => {
             let body = request.bytes().await?;
+            tracing::info!(data_len = body.len(), "Proxied request");
             Ok((StatusCode::OK, body))
         }
         status => {
             let status_code = status.as_u16();
             let body = request.bytes().await?;
+            tracing::error!(status_code, "Error during proxy request");
             Ok((StatusCode::from_u16(status_code)?, body))
         }
     }
@@ -117,21 +110,6 @@ async fn handler(
 
 async fn handler_404() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "nothing to see here")
-}
-
-#[derive(Clone, Debug)]
-struct ClientConnectInfo {
-    peer_addr: Arc<SocketAddr>,
-}
-
-impl Connected<IncomingStream<'_>> for ClientConnectInfo {
-    fn connect_info(target: IncomingStream<'_>) -> Self {
-        let peer_addr = target.remote_addr();
-
-        Self {
-            peer_addr: Arc::new(peer_addr),
-        }
-    }
 }
 
 struct AppError(anyhow::Error);
