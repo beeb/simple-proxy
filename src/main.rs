@@ -5,14 +5,14 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
 use axum_auth::AuthBearer;
 use clap::Parser;
-use reqwest::Client;
+use reqwest::{header::HeaderValue, Client};
 use tower::ServiceBuilder;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let _ = dotenvy::dotenv();
+    dotenvy::dotenv().ok();
     let port = env::var("PORT").unwrap_or("7788".to_string());
     let auth_token = env::var("AUTH_TOKEN")?;
     AUTH_TOKEN
@@ -82,6 +82,7 @@ async fn handler(
         tracing::error!(peer = addr.to_string(), "Unauthorized access attempt");
         return Ok((
             StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
             Bytes::from_static(b"Unauthorized"),
         ));
     }
@@ -89,21 +90,32 @@ async fn handler(
         tracing::error!(peer = addr.to_string(), "Missing `url` param");
         return Ok((
             StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
             Bytes::from_static(b"Missing `url` param"),
         ));
     };
     let request = state.client.get(url).send().await?;
     match request.status() {
         reqwest::StatusCode::OK => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                request
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .unwrap_or(&HeaderValue::from_str("text/plain")?)
+                    .to_str()?
+                    .parse()?,
+            );
             let body = request.bytes().await?;
             tracing::info!(data_len = body.len(), "Proxied request");
-            Ok((StatusCode::OK, body))
+            Ok((StatusCode::OK, headers, body))
         }
         status => {
             let status_code = status.as_u16();
             let body = request.bytes().await?;
             tracing::error!(status_code, "Error during proxy request");
-            Ok((StatusCode::from_u16(status_code)?, body))
+            Ok((StatusCode::from_u16(status_code)?, HeaderMap::new(), body))
         }
     }
 }
