@@ -1,13 +1,19 @@
 /// A simple proxy that forwards requests to a given URL with a custom User-Agent.
-use std::{collections::HashMap, env, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    env,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{connect_info::Connected, ConnectInfo, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
+    serve::IncomingStream,
     Router,
 };
 use axum_auth::AuthBearer;
@@ -64,33 +70,68 @@ async fn main() -> Result<()> {
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
 async fn handler(
     AuthBearer(token): AuthBearer,
     Query(params): Query<HashMap<String, String>>,
+    ConnectInfo(ci): ConnectInfo<ClientConnectInfo>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     if &token != AUTH_TOKEN.get().unwrap() {
+        tracing::error!(
+            peer = ci.peer_addr.to_string(),
+            "Unauthorized access attempt"
+        );
         return Ok((
             StatusCode::UNAUTHORIZED,
-            Bytes::from_static(b"unauthorized"),
+            Bytes::from_static(b"Unauthorized"),
         ));
     }
     let Some(url) = params.get("url") else {
+        tracing::error!(peer = ci.peer_addr.to_string(), "Missing `url` param");
         return Ok((
             StatusCode::BAD_REQUEST,
             Bytes::from_static(b"Missing `url` param"),
         ));
     };
-    let body = state.client.get(url).send().await?.bytes().await?;
-    Ok((StatusCode::OK, body))
+    let request = state.client.get(url).send().await?;
+    match request.status() {
+        reqwest::StatusCode::OK => {
+            let body = request.bytes().await?;
+            Ok((StatusCode::OK, body))
+        }
+        status => {
+            let status_code = status.as_u16();
+            let body = request.bytes().await?;
+            Ok((StatusCode::from_u16(status_code)?, body))
+        }
+    }
 }
 
 async fn handler_404() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "nothing to see here")
+}
+
+#[derive(Clone, Debug)]
+struct ClientConnectInfo {
+    peer_addr: Arc<SocketAddr>,
+}
+
+impl Connected<IncomingStream<'_>> for ClientConnectInfo {
+    fn connect_info(target: IncomingStream<'_>) -> Self {
+        let peer_addr = target.remote_addr();
+
+        Self {
+            peer_addr: Arc::new(peer_addr),
+        }
+    }
 }
 
 struct AppError(anyhow::Error);
