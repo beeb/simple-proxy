@@ -1,23 +1,26 @@
 /// A simple proxy that forwards requests to a given URL with a custom User-Agent.
-use std::{convert::Infallible, env, time::Duration};
+use std::{convert::Infallible, env, str::FromStr, time::Duration};
 
 use anyhow::{Context as _, Result};
 use rama::{
     http::{
         client::HttpClient,
+        headers::UserAgent,
         layer::{
+            proxy_auth::ProxyAuthLayer,
             remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
             set_header::SetRequestHeaderLayer,
             trace::TraceLayer,
-            validate_request::ValidateRequestHeaderLayer,
+            upgrade::{UpgradeLayer, Upgraded},
         },
+        matcher::MethodMatcher,
         server::HttpServer,
-        Body, HeaderName, HeaderValue, Request, Response, StatusCode,
+        Body, IntoResponse as _, Request, RequestContext, Response, StatusCode,
     },
     rt::Executor,
-    service::{Context, Service as _, ServiceBuilder},
+    service::{service_fn, Context, Service as _, ServiceBuilder},
     stream::layer::http::BodyLimitLayer,
-    tcp::server::TcpListener,
+    tcp::{server::TcpListener, utils::is_connection_error},
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -45,21 +48,28 @@ async fn main() -> Result<()> {
         let tcp_service = TcpListener::build()
             .bind(format!("0.0.0.0:{port}"))
             .await
-            .expect("bind on port");
+            .context("bind on port")?;
+        tracing::info!("listening on port {port}");
 
         let exec = Executor::graceful(guard.clone());
         let http_service = HttpServer::auto(exec).service(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(ValidateRequestHeaderLayer::bearer(&auth_token))
-                .layer(RemoveRequestHeaderLayer::exact("Authorization"))
-                // .layer(SetRequestHeaderLayer::overriding(
-                //     HeaderName::from_static("user-agent"),
-                //     HeaderValue::from_str(&user_agent),
-                // ))
-                .layer(RemoveRequestHeaderLayer::hop_by_hop())
-                .layer(RemoveResponseHeaderLayer::hop_by_hop())
-                .service_fn(http_plain_proxy),
+                .layer(ProxyAuthLayer::basic(("proxy".to_string(), auth_token)))
+                .layer(SetRequestHeaderLayer::overriding_typed(
+                    UserAgent::from_str(&user_agent).context("decoding user agent")?,
+                ))
+                .layer(UpgradeLayer::new(
+                    MethodMatcher::CONNECT,
+                    service_fn(http_connect_accept),
+                    service_fn(http_connect_proxy),
+                ))
+                .service(
+                    ServiceBuilder::new()
+                        .layer(RemoveRequestHeaderLayer::hop_by_hop())
+                        .layer(RemoveResponseHeaderLayer::hop_by_hop())
+                        .service_fn(http_plain_proxy),
+                ),
         );
 
         tcp_service
@@ -70,30 +80,65 @@ async fn main() -> Result<()> {
                     .service(http_service),
             )
             .await;
+
+        Result::<(), anyhow::Error>::Ok(())
     });
 
     graceful
         .shutdown_with_limit(Duration::from_secs(30))
         .await?;
 
-    // let client = Client::builder().user_agent(user_agent).build()?;
-    // let app_state = AppState { client };
+    Ok(())
+}
 
-    // let compression_service = ServiceBuilder::new().layer(CompressionLayer::new());
+async fn http_connect_accept<S>(
+    mut ctx: Context<S>,
+    req: Request,
+) -> Result<(Response, Context<S>, Request), Response>
+where
+    S: Send + Sync + 'static,
+{
+    tracing::debug!("connect accept: {req:?}");
+    match ctx
+        .get_or_insert_with::<RequestContext>(|| RequestContext::from(&req))
+        .host
+        .as_ref()
+    {
+        Some(host) => tracing::info!("accept CONNECT to {host}"),
+        None => {
+            tracing::error!("error extracting host");
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+    }
 
-    // let app = Router::new()
-    //     .route("/", get(handler))
-    //     .fallback(handler_404)
-    //     .layer(TraceLayer::new_for_http())
-    //     .layer(compression_service)
-    //     .with_state(app_state);
+    Ok((StatusCode::OK.into_response(), ctx, req))
+}
 
-    // let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    // axum::serve(
-    //     listener,
-    //     app.into_make_service_with_connect_info::<SocketAddr>(),
-    // )
-    // .await?;
+async fn http_connect_proxy<S>(ctx: Context<S>, mut upgraded: Upgraded) -> Result<(), Infallible>
+where
+    S: Send + Sync + 'static,
+{
+    tracing::debug!("connect proxy: {upgraded:?}");
+    let host = ctx
+        .get::<RequestContext>()
+        .unwrap()
+        .host
+        .as_ref()
+        .unwrap()
+        .clone();
+    tracing::info!("CONNECT to {}", host);
+    let mut stream = match tokio::net::TcpStream::connect(&host).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::error!(error = %err, "error connecting to host");
+            return Ok(());
+        }
+    };
+    if let Err(err) = tokio::io::copy_bidirectional(&mut upgraded, &mut stream).await {
+        if !is_connection_error(&err) {
+            tracing::error!(error = %err, "error copying data");
+        }
+    }
     Ok(())
 }
 
@@ -101,6 +146,7 @@ async fn http_plain_proxy<S>(ctx: Context<S>, req: Request) -> Result<Response, 
 where
     S: Send + Sync + 'static,
 {
+    tracing::debug!("plain proxy: {req:?}");
     let client = HttpClient::default();
     match client.serve(ctx, req).await {
         Ok(resp) => Ok(resp),
@@ -113,76 +159,3 @@ where
         }
     }
 }
-
-// async fn handler(
-//     AuthBearer(token): AuthBearer,
-//     Query(params): Query<HashMap<String, String>>,
-//     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-//     State(state): State<AppState>,
-// ) -> Result<impl IntoResponse, AppError> {
-//     if &token != AUTH_TOKEN.get().unwrap() {
-//         tracing::error!(peer = addr.to_string(), "Unauthorized access attempt");
-//         return Ok((
-//             StatusCode::UNAUTHORIZED,
-//             HeaderMap::new(),
-//             Bytes::from_static(b"Unauthorized"),
-//         ));
-//     }
-//     let Some(url) = params.get("url") else {
-//         tracing::error!(peer = addr.to_string(), "Missing `url` param");
-//         return Ok((
-//             StatusCode::BAD_REQUEST,
-//             HeaderMap::new(),
-//             Bytes::from_static(b"Missing `url` param"),
-//         ));
-//     };
-//     let request = state.client.get(url).send().await?;
-//     match request.status() {
-//         reqwest::StatusCode::OK => {
-//             let mut headers = HeaderMap::new();
-//             headers.insert(
-//                 header::CONTENT_TYPE,
-//                 request
-//                     .headers()
-//                     .get(reqwest::header::CONTENT_TYPE)
-//                     .unwrap_or(&HeaderValue::from_str("text/plain")?)
-//                     .to_str()?
-//                     .parse()?,
-//             );
-//             let body = request.bytes().await?;
-//             tracing::info!(data_len = body.len(), "Proxied request");
-//             Ok((StatusCode::OK, headers, body))
-//         }
-//         status => {
-//             let status_code = status.as_u16();
-//             let body = request.bytes().await?;
-//             tracing::error!(status_code, "Error during proxy request");
-//             Ok((StatusCode::from_u16(status_code)?, HeaderMap::new(), body))
-//         }
-//     }
-// }
-
-// async fn handler_404() -> impl IntoResponse {
-//     (StatusCode::NOT_FOUND, "nothing to see here")
-// }
-
-// struct AppError(anyhow::Error);
-
-// impl IntoResponse for AppError {
-//     fn into_response(self) -> axum::response::Response {
-//         (
-//             StatusCode::INTERNAL_SERVER_ERROR,
-//             format!("Something went wrong: {}", self.0),
-//         )
-//             .into_response()
-//     }
-// }
-
-// impl<E> From<E> for AppError
-// where
-//     E: Into<anyhow::Error>,
-// {
-//     fn from(err: E) -> Self {
-//         Self(err.into())
-//     }
-// }
