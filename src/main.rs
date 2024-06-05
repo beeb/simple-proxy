@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
             )
             .await;
 
-        Result::<(), anyhow::Error>::Ok(())
+        Result::<()>::Ok(())
     });
 
     graceful
