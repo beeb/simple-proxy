@@ -1,5 +1,5 @@
 /// A simple proxy that forwards requests to a given URL with a custom User-Agent.
-use std::{convert::Infallible, env, str::FromStr, time::Duration};
+use std::{convert::Infallible, env, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use rama::{
@@ -11,16 +11,21 @@ use rama::{
             remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
             set_header::SetRequestHeaderLayer,
             trace::TraceLayer,
-            upgrade::{UpgradeLayer, Upgraded},
         },
-        matcher::MethodMatcher,
         server::HttpServer,
-        Body, IntoResponse as _, Request, RequestContext, Response, StatusCode,
+        Body, Request, Response, StatusCode,
     },
     rt::Executor,
-    service::{service_fn, Context, Service as _, ServiceBuilder},
+    service::{Context, Service as _, ServiceBuilder},
     stream::layer::http::BodyLimitLayer,
-    tcp::{server::TcpListener, utils::is_connection_error},
+    tcp::{server::TcpListener, service::HttpConnector},
+    tls::rustls::{
+        client::HttpsConnector,
+        dep::{
+            rustls::{ClientConfig, RootCertStore},
+            webpki_roots,
+        },
+    },
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -56,16 +61,11 @@ async fn main() -> Result<()> {
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .layer(ProxyAuthLayer::basic(("proxy".to_string(), auth_token)))
-                .layer(SetRequestHeaderLayer::overriding_typed(
-                    UserAgent::from_str(&user_agent).context("decoding user agent")?,
-                ))
-                .layer(UpgradeLayer::new(
-                    MethodMatcher::CONNECT,
-                    service_fn(http_connect_accept),
-                    service_fn(http_connect_proxy),
-                ))
                 .service(
                     ServiceBuilder::new()
+                        .layer(SetRequestHeaderLayer::overriding_typed(
+                            UserAgent::from_str(&user_agent).context("decoding user agent")?,
+                        ))
                         .layer(RemoveRequestHeaderLayer::hop_by_hop())
                         .layer(RemoveResponseHeaderLayer::hop_by_hop())
                         .service_fn(http_plain_proxy),
@@ -91,63 +91,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn http_connect_accept<S>(
-    mut ctx: Context<S>,
-    req: Request,
-) -> Result<(Response, Context<S>, Request), Response>
-where
-    S: Send + Sync + 'static,
-{
-    tracing::debug!("connect accept: {req:?}");
-    match ctx
-        .get_or_insert_with::<RequestContext>(|| RequestContext::from(&req))
-        .host
-        .as_ref()
-    {
-        Some(host) => tracing::info!("accept CONNECT to {host}"),
-        None => {
-            tracing::error!("error extracting host");
-            return Err(StatusCode::BAD_REQUEST.into_response());
-        }
-    }
-
-    Ok((StatusCode::OK.into_response(), ctx, req))
-}
-
-async fn http_connect_proxy<S>(ctx: Context<S>, mut upgraded: Upgraded) -> Result<(), Infallible>
-where
-    S: Send + Sync + 'static,
-{
-    tracing::debug!("connect proxy: {upgraded:?}");
-    let host = ctx
-        .get::<RequestContext>()
-        .unwrap()
-        .host
-        .as_ref()
-        .unwrap()
-        .clone();
-    tracing::info!("CONNECT to {}", host);
-    let mut stream = match tokio::net::TcpStream::connect(&host).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            tracing::error!(error = %err, "error connecting to host");
-            return Ok(());
-        }
-    };
-    if let Err(err) = tokio::io::copy_bidirectional(&mut upgraded, &mut stream).await {
-        if !is_connection_error(&err) {
-            tracing::error!(error = %err, "error copying data");
-        }
-    }
-    Ok(())
-}
-
 async fn http_plain_proxy<S>(ctx: Context<S>, req: Request) -> Result<Response, Infallible>
 where
     S: Send + Sync + 'static,
 {
     tracing::debug!("plain proxy: {req:?}");
-    let client = HttpClient::default();
+    let root_cert_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(Arc::new(root_cert_store))
+        .with_no_client_auth();
+    let connector =
+        HttpsConnector::secure_only(HttpConnector::default()).with_config(Arc::new(client_config));
+    let client = HttpClient::new(connector);
     match client.serve(ctx, req).await {
         Ok(resp) => Ok(resp),
         Err(err) => {
