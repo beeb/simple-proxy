@@ -1,5 +1,5 @@
 /// A simple proxy that forwards requests to a given URL with a custom User-Agent.
-use std::{convert::Infallible, env, str::FromStr, sync::Arc, time::Duration};
+use std::{convert::Infallible, env, str::FromStr, time::Duration};
 
 use anyhow::{Context as _, Result};
 use rama::{
@@ -7,9 +7,11 @@ use rama::{
         client::HttpClient,
         headers::UserAgent,
         layer::{
+            follow_redirect::{policy::Limited, FollowRedirectLayer},
             proxy_auth::ProxyAuthLayer,
             remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
             set_header::SetRequestHeaderLayer,
+            timeout::TimeoutLayer,
             trace::TraceLayer,
         },
         server::HttpServer,
@@ -19,13 +21,7 @@ use rama::{
     service::{Context, Service as _, ServiceBuilder},
     stream::layer::http::BodyLimitLayer,
     tcp::{server::TcpListener, service::HttpConnector},
-    tls::rustls::{
-        client::HttpsConnector,
-        dep::{
-            rustls::{ClientConfig, RootCertStore},
-            webpki_roots,
-        },
-    },
+    tls::rustls::client::HttpsConnectorLayer,
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -96,13 +92,17 @@ where
     S: Send + Sync + 'static,
 {
     tracing::debug!("plain proxy: {req:?}");
-    let root_cert_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let client_config = ClientConfig::builder()
-        .with_root_certificates(Arc::new(root_cert_store))
-        .with_no_client_auth();
-    let connector =
-        HttpsConnector::secure_only(HttpConnector::default()).with_config(Arc::new(client_config));
-    let client = HttpClient::new(connector);
+
+    let client = ServiceBuilder::new()
+        .layer(TimeoutLayer::new(Duration::from_secs(5)))
+        .layer(FollowRedirectLayer::with_policy(Limited::new(3)))
+        .service(HttpClient::new(
+            ServiceBuilder::new()
+                .layer(HttpsConnectorLayer::auto())
+                .layer(HttpsConnectorLayer::tunnel())
+                .service(HttpConnector::default()),
+        ));
+
     match client.serve(ctx, req).await {
         Ok(resp) => Ok(resp),
         Err(err) => {
